@@ -1,0 +1,18 @@
+# ESP32-WROOM-32 defaults for the Pandora emulator.
+
+# Run the CPU at 240 MHz for maximum emulation throughput.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+
+# Use the default 4 MB flash layout; the firmware image is embedded in the app.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Give the emulator a roomy main task stack (core + MMIO recursion headroom).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# The emulator runs long bursts between vTaskDelay(1); relax the task watchdog
+# so a long boot/unlock pass does not trip it. (The main loop still yields.)
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+
+# Compiler optimization for speed (the interpreter is the hot path).
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
