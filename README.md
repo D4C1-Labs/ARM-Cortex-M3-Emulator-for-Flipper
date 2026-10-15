@@ -20,14 +20,18 @@ run any firmware **without recompiling/reflashing the ESP32**.
 Load sequence (see `protocol.h`):
 
 ```
-Flipper -> ESP32  FW_BEGIN {total_hex_bytes, profile}   resets the HEX parser
+Flipper -> ESP32  FW_BEGIN {total_hex_bytes}             resets the HEX parser
 Flipper -> ESP32  FW_CHUNK <raw .hex ASCII bytes> ...    parsed line by line
-Flipper -> ESP32  FW_END   {crc32? optional}             finalize + boot + unlock
+Flipper -> ESP32  FW_END   {crc32? optional}             finalize + boot
 ESP32   -> Flipper FW_ACK  {ok, flat_size}               load result
+Flipper -> ESP32  UNLOCK   {knock sequence}              emu_set_knock + auto-unlock
 ESP32   -> Flipper FW_PROGRESS {hex_bytes_seen, flat_bytes}  (optional, periodic)
 ```
 
-`profile`: `0 = PANDORA_MAX`, `1 = PANDORA` (picks `flash_used`, pins, knock code).
+**AGNOSTIC: there is NO profile.** The hardware is identical for every firmware of
+this keyfob, so any `.hex` loads onto the single HW model. The unlock knock-code
+(FIRMWARE config — a button combo) is sent explicitly by the Flipper via
+`PROTO_MSG_UNLOCK` and pressed over GPIO by `emu_reset_and_unlock`.
 
 ### Memory-efficient incremental parse
 
@@ -104,17 +108,18 @@ idf.py -p /dev/ttyUSB0 flash monitor           # flash + serial console
 
 The app binary is ~230 KB (78 % of the app partition free).
 
-### Choosing the firmware/profile
+### Choosing the firmware (agnostic — no profile)
 
-The firmware and profile are chosen **at runtime** by the Flipper in the
-`FW_BEGIN` message (`profile` = 0 PANDORA_MAX, 1 PANDORA) — no rebuild needed.
+The firmware is chosen **at runtime** by the Flipper (`FW_BEGIN`/`FW_CHUNK`/
+`FW_END`); any `.hex` for this MCU loads onto the single HW model — no rebuild and
+no profile id. The **unlock knock** is sent afterward via `PROTO_MSG_UNLOCK`.
 
 **Optional embedded fallback.** To build an image that embeds `firmware.bin` and
 boots it immediately (old behaviour), still accepting an over-the-wire reload:
 
 ```sh
-cp ../bins/PANDORA_MAX.flash.bin main/firmware.bin   # or the other unit
-idf.py build -DPANDORA_EMBED_FW=1                     # add -DPANDORA_PROFILE=... if needed
+cp ../bins/PANDORA_MAX.flash.bin main/firmware.bin   # any unit; HW is identical
+idf.py build -DPANDORA_EMBED_FW=1                     # uses the default embedded knock
 ```
 
 ## Wiring (ESP32 <-> Flipper)
@@ -173,23 +178,30 @@ CRC covers TYPE+LEN+PAYLOAD (not SYNC).
 - `LOG` (0x04) / `PONG` (0x05).
 
 - `FW_ACK` (0x06): `{uint8 ok; uint32 flat_size}` — sent after `FW_END`. `ok=1`
-  if the HEX parsed and the emulator initialized + unlocked.
+   if the HEX parsed and the emulator initialized (unlock happens on `UNLOCK`).
 - `FW_PROGRESS` (0x07): `{uint32 hex_bytes_seen; uint32 flat_bytes}` — optional,
-  periodic during upload.
+   periodic during upload.
 
 **Flipper -> ESP32**
 - `BTN` (0x81): 1-byte bitmask (UP/DOWN/OK/BACK/B5/B6).
-- `RX_EDGE` (0x82): `{level, duration_us}` — a received RF edge, injected into PB0.
-- `PING` (0x83) / `REQ_FB` (0x84) / `RESET` (0x85).
-- `FW_BEGIN` (0x86): `{uint32 total_hex_bytes; uint8 profile}` — start a firmware
-  upload; resets the HEX parser. `profile`: 0 = PANDORA_MAX, 1 = PANDORA.
+- `RX_EDGE` (0x82): `{level, duration_us}` — a single received RF edge → PB0.
+- `PING` (0x83) / `REQ_FB` (0x84) / `RESET` (0x85, re-run the last knock).
+- `FW_BEGIN` (0x86): `{uint32 total_hex_bytes}` — start a firmware upload; resets
+  the HEX parser. **No profile** (agnostic).
 - `FW_CHUNK` (0x87): raw Intel HEX text bytes (up to `PROTO_MAX_PAYLOAD`),
   accumulated and parsed incrementally.
 - `FW_END` (0x88): `{uint32 crc32}` (optional) — finalize: parse remainder, run
-  `emu_init` + `emu_reset_and_unlock`, reply `FW_ACK`.
+  `emu_init`, boot the firmware, reply `FW_ACK`.
+- `RX_EDGES` (0x89): `{uint16 count; proto_rf_edge_t edge[count]}` — a **batch** of
+  received RF edges, each injected into PB0 (preferred over `RX_EDGE` for
+  throughput; the ESP32 handles both).
+- `STOP` (0x8A): stop/release the emulator when the Flipper frontend exits.
+- `UNLOCK` (0x8B): `{proto_unlock_t; proto_knock_step_t step[count]}` — the unlock
+  knock button-combo. The ESP32 calls `emu_set_knock()` then
+  `emu_reset_and_unlock()` (presses it over GPIO). `count=0` disables auto-unlock.
 
-Input and control messages (`BTN`, `RX_EDGE`, `REQ_FB`, `RESET`) are ignored
-until a firmware is loaded; `PING`/`FW_*` are always accepted.
+Input/control messages (`BTN`, `RX_EDGE`, `RX_EDGES`, `REQ_FB`, `RESET`, `UNLOCK`)
+are ignored until a firmware is loaded; `PING`/`FW_*`/`STOP` are always accepted.
 
 ## What was ported from the Flipper `PandoraARM/main.c`
 
@@ -198,8 +210,10 @@ until a firmware is loaded; `PING`/`FW_*` are always accepted.
   PE9), GPIO DIN/DOUT (buttons + OLED + radio).
 - The Si4432 model and OLED capture (92×16 framebuffer, double-buffered).
 - `run_burst` (NVIC tick + EXC_RETURN) and the round-robin `nvic_tick`.
-- `auto_unlock` (PC-synchronized knock-code injection) and the per-firmware
-  profiles (addresses, pins, knock sequences).
+- `auto_unlock` — now AGNOSTIC: the knock-code is a button sequence supplied by the
+  Flipper (`PROTO_MSG_UNLOCK`) and pressed purely over GPIO. There are no
+  per-firmware profiles (addresses/pins/knock) any more — the single HW profile
+  runs any `.hex`.
 
 The Flipper-specific GUI and the paged-flash cache were **dropped** (not needed
 on the ESP32).

@@ -12,21 +12,29 @@
  *
  * FIRMWARE SOURCE (new): the firmware is NO LONGER embedded in the ESP32. The
  * Flipper reads the firmware .hex (Intel HEX, ASCII) from its SD card and streams
- * it over this UART link:
+ * it over this UART link. It is AGNOSTIC: ANY .hex for this MCU loads onto the
+ * single hardware model -- there is NO profile selection.
  *
- *   FW_BEGIN {total_hex_bytes, profile}   -> (re)init the HEX parser onto a flat
- *                                            buffer sized flash_used for profile
+ *   FW_BEGIN {total_hex_bytes}            -> (re)init the HEX parser onto a flat
+ *                                            buffer sized to the flash WINDOW
+ *                                            (agnostic; NOT a per-firmware size)
  *   FW_CHUNK <raw .hex bytes> ...          -> parsed INCREMENTALLY, line by line,
  *                                            straight into the flat buffer
- *   FW_END   {crc32?}                      -> emu_init(flat) + emu_reset_and_unlock
+ *   FW_END   {crc32?}                      -> emu_init(flat, real_len)
  *   ESP32 -> FW_ACK {ok, flat_size}        -> load result
+ *   UNLOCK  {knock sequence}               -> emu_set_knock + emu_reset_and_unlock
+ *
+ * UNLOCK: the knock-code is FIRMWARE CONFIG (a button combo), so the Flipper owns
+ * it and sends it explicitly as a button SEQUENCE. The agnostic emulator just
+ * presses it over GPIO at reset. There is no per-firmware knock table here.
  *
  * MEMORY: the ~193 KB .hex text is NEVER buffered whole. The parser keeps at most
  * one partial line (<600 B) between chunks and writes decoded bytes directly into
- * the flat flash image (flash_used = 0x15400 pmax / 0x13800 pandora). After the
- * flat image is handed to emu_init (which keeps its own copy), the temporary flat
- * buffer is freed, so steady-state uses only: emu flash (~85 KB) + emu RAM (32 KB)
- * + core + the small line buffer.
+ * the flat flash image. The emulator then derives its real flash size from the
+ * parsed image length (agnostic -- no flash_used constants). After the flat image
+ * is handed to emu_init (which keeps its own copy), the temporary flat buffer is
+ * freed, so steady-state uses only: emu flash (image-sized) + emu RAM (32 KB) +
+ * core + the small line buffer.
  *
  * FALLBACK: build with -DPANDORA_EMBED_FW to also embed firmware.bin and boot it
  * immediately (the old behaviour), still accepting an over-the-wire reload.
@@ -53,10 +61,13 @@ static const char* TAG = "pandora";
 /* Optional embedded firmware image (flat .flash.bin). See main/CMakeLists.txt. */
 extern const uint8_t fw_start[] asm("_binary_firmware_bin_start");
 extern const uint8_t fw_end[] asm("_binary_firmware_bin_end");
-/* Default embedded profile; override at build time. */
-#ifndef PANDORA_PROFILE
-#define PANDORA_PROFILE (&PROFILE_PANDORAMAX)
-#endif
+/* The single agnostic hardware profile runs any embedded image. */
+#define PANDORA_PROFILE (&PROFILE_PANDORA_HW)
+/* Default embedded knock-code (FIRMWARE config) pressed over GPIO after boot.
+ * Override by sending PROTO_MSG_UNLOCK from the Flipper. Matches the classic
+ * Pandora combo: UP,OK,OK,UP,UP,DOWN then hold B5 as the gate. */
+static const uint8_t EMBED_KNOCK_SEQ[] = {B_UP, B_OK, B_OK, B_UP, B_UP, B_DOWN};
+#define EMBED_KNOCK_GATE B5
 #endif
 
 /* How many instructions to execute between UART service passes. On the ESP32 at
@@ -70,6 +81,13 @@ extern const uint8_t fw_end[] asm("_binary_firmware_bin_end");
 /* Report upload progress to the Flipper every this many raw .hex bytes. */
 #define FW_PROGRESS_EVERY 16384u
 
+/* AGNOSTIC flat-flash window for the incremental HEX parser. The EFM32 keyfob
+ * flash is 256KB; any address at/above this is dropped (far EFM32 info pages at
+ * 0x0FE00000 etc). This transient buffer is freed right after emu_init, which
+ * derives the REAL flash size from the parsed image length -- so there are no
+ * per-firmware flash_used constants anywhere. */
+#define FW_FLAT_WINDOW 0x00044000u
+
 typedef struct {
     EmuState* emu;
     uart_proto_t* up;
@@ -80,26 +98,15 @@ typedef struct {
     uint32_t last_beep_push_ms;
 
     /* ---- firmware-over-UART load state ---- */
-    bool emu_ready; /* true once a firmware is loaded and unlocked */
+    bool emu_ready; /* true once a firmware is loaded (unlock happens on UNLOCK) */
     bool loading; /* true between FW_BEGIN and FW_END */
-    const ArmProfile* load_prof; /* profile selected by FW_BEGIN */
+    const ArmProfile* load_prof; /* HW profile (agnostic; always the single HW) */
     uint8_t* flat; /* temporary flat image being filled by the parser */
-    uint32_t flat_cap; /* = load_prof->flash_used */
+    uint32_t flat_cap; /* flat HEX window (agnostic: fixed max flash window) */
     ihex_parser_t hex; /* incremental Intel HEX parser */
     uint32_t next_progress; /* next hex_bytes threshold to report */
     int load_err; /* first IHEX_ERR_* seen during this load, 0 = none */
 } AppCtx;
-
-/* Map a wire profile id to the emulator's profile table. */
-static const ArmProfile* profile_from_id(uint8_t id) {
-    switch(id) {
-    case PROTO_FW_PROFILE_PANDORA:
-        return &PROFILE_PANDORA;
-    case PROTO_FW_PROFILE_PANDORAMAX:
-    default:
-        return &PROFILE_PANDORAMAX;
-    }
-}
 
 /* ------------------------------------------------------- outbound helpers ---- */
 static void push_fb(AppCtx* a) {
@@ -172,8 +179,12 @@ static void fw_begin(AppCtx* a, const uint8_t* payload, uint16_t len) {
     /* If a previous load left scratch around, drop it and start fresh. */
     load_cleanup(a);
 
-    a->load_prof = profile_from_id(hb.profile);
-    a->flat_cap = a->load_prof->flash_used;
+    /* Agnostic: there is a SINGLE hardware profile for every firmware of this
+     * keyfob (no profile selection on the wire). The flat window is the flash
+     * size, NOT a per-firmware flash_used. emu_init later trims to the real
+     * image length. */
+    a->load_prof = &PROFILE_PANDORA_HW;
+    a->flat_cap = FW_FLAT_WINDOW;
     a->flat = (uint8_t*)malloc(a->flat_cap);
     if(!a->flat) {
         ESP_LOGE(TAG, "FW_BEGIN: OOM allocating %u-byte flat image", (unsigned)a->flat_cap);
@@ -185,8 +196,8 @@ static void fw_begin(AppCtx* a, const uint8_t* payload, uint16_t len) {
     ihex_init(&a->hex, a->flat, a->flat_cap);
     a->loading = true;
     a->next_progress = FW_PROGRESS_EVERY;
-    ESP_LOGI(TAG, "FW_BEGIN profile=%s (id=%u) hex=%u bytes, flat_cap=0x%X",
-             a->load_prof->name, hb.profile, (unsigned)hb.total_hex_bytes,
+    ESP_LOGI(TAG, "FW_BEGIN hw=%s hex=%u bytes, flat_cap=0x%X",
+             a->load_prof->name, (unsigned)hb.total_hex_bytes,
              (unsigned)a->flat_cap);
 }
 
@@ -245,8 +256,11 @@ static void fw_end(AppCtx* a, const uint8_t* payload, uint16_t len) {
         a->emu_ready = false;
     }
 
-    /* emu_init keeps its own copy of the flat image, so free our scratch after. */
-    int ir = emu_init(a->emu, a->load_prof, a->flat, a->flat_cap);
+    /* emu_init keeps its own copy of the flat image, so free our scratch after.
+     * Pass the REAL parsed image length (hex.highest), not the flat window, so
+     * the emulator sizes its flash from the firmware itself (agnostic). */
+    uint32_t image_len = a->hex.highest ? a->hex.highest : a->flat_cap;
+    int ir = emu_init(a->emu, a->load_prof, a->flat, image_len);
     if(ir != 0) {
         ESP_LOGE(TAG, "emu_init failed (rc=%d, out of memory?)", ir);
         load_cleanup(a);
@@ -257,12 +271,16 @@ static void fw_end(AppCtx* a, const uint8_t* payload, uint16_t len) {
     a->flat = NULL;
     a->loading = false;
 
-    ESP_LOGI(TAG, "booting firmware + auto-unlock (profile=%s)...", a->load_prof->name);
+    /* Boot the firmware WITHOUT a knock. The Flipper drives the unlock later via
+     * PROTO_MSG_UNLOCK (with the user's knock sequence), decoupling firmware load
+     * from unlock. Until then the firmware runs its locked screen. */
+    emu_set_knock(a->emu, NULL, 0, -1);
+    ESP_LOGI(TAG, "booting firmware (hw=%s), awaiting UNLOCK knock...", a->load_prof->name);
     int64_t t0 = esp_timer_get_time();
     emu_reset_and_unlock(a->emu);
     int64_t t1 = esp_timer_get_time();
     a->emu_ready = true;
-    ESP_LOGI(TAG, "unlock done in %lld ms, unlocked=%d, PC=0x%08X, free heap=%u",
+    ESP_LOGI(TAG, "boot done in %lld ms, unlocked=%d, PC=0x%08X, free heap=%u",
              (t1 - t0) / 1000, a->emu->unlocked,
              (unsigned)thumb_get_reg(a->emu->cpu, 15),
              (unsigned)esp_get_free_heap_size());
@@ -281,20 +299,62 @@ static void fw_end(AppCtx* a, const uint8_t* payload, uint16_t len) {
     push_rf_if_changed(a);
 }
 
-/* Let Pandora's foreground loop consume a completed decoder frame before
- * subsequent edges in the same UART batch are injected. This mirrors the
- * internal frontend's one-frame-at-a-time replay discipline. */
+/* ------------------------------------------------- auto-unlock knock handler --
+ * PROTO_MSG_UNLOCK: payload = proto_unlock_t + count * proto_knock_step_t. The
+ * Flipper owns the knock-code (FIRMWARE config, a button combo); here we install
+ * it with emu_set_knock() and press it over GPIO via emu_reset_and_unlock(). The
+ * `hold` flag on each step is accepted on the wire; the agnostic GPIO unlock
+ * presses the taps + holds the final gate, matching the real keyfob combo. */
+static void fw_unlock(AppCtx* a, const uint8_t* payload, uint16_t len) {
+    if(!a->emu_ready) {
+        ESP_LOGW(TAG, "UNLOCK ignored: no firmware loaded yet");
+        return;
+    }
+    if(len < sizeof(proto_unlock_t)) {
+        ESP_LOGW(TAG, "UNLOCK too short (%u)", len);
+        return;
+    }
+    proto_unlock_t uh;
+    memcpy(&uh, payload, sizeof(uh));
+    const uint8_t* steps = payload + sizeof(uh);
+    size_t avail = len - sizeof(uh);
+    uint8_t count = uh.count;
+    if(count > PROTO_KNOCK_MAX_STEPS) count = PROTO_KNOCK_MAX_STEPS;
+    if((size_t)count * sizeof(proto_knock_step_t) > avail)
+        count = (uint8_t)(avail / sizeof(proto_knock_step_t));
+
+    /* Flatten the step list to the B_* sequence the core expects. The emulator
+     * core presses each as a tap; the gate is held during validation. */
+    uint8_t seq[PROTO_KNOCK_MAX_STEPS];
+    for(uint8_t i = 0; i < count; i++) {
+        proto_knock_step_t st;
+        memcpy(&st, steps + (size_t)i * sizeof(st), sizeof(st));
+        seq[i] = st.button; /* PROTO_BTN_ID_* == B_* index */
+    }
+    int gate = (uh.gate == PROTO_BTN_ID_NONE) ? -1 : (int)uh.gate;
+
+    emu_set_knock(a->emu, count ? seq : NULL, count, gate);
+    ESP_LOGI(TAG, "UNLOCK: knock len=%u gate=%d -> GPIO auto-unlock...", count, gate);
+    int64_t t0 = esp_timer_get_time();
+    emu_reset_and_unlock(a->emu);
+    int64_t t1 = esp_timer_get_time();
+    ESP_LOGI(TAG, "unlock done in %lld ms, unlocked=%d, PC=0x%08X",
+             (t1 - t0) / 1000, a->emu->unlocked,
+             (unsigned)thumb_get_reg(a->emu->cpu, 15));
+
+    push_fb(a);
+    push_rf_if_changed(a);
+}
+
+/* Let the firmware's foreground loop consume an injected RF edge before the next
+ * edge in the same UART batch. AGNOSTIC: emu_rx_inject_edge already presents the
+ * edge on the real RX-data pin (PB0) + TIMER1 capture and runs a few foreground
+ * bursts itself; here we just give a little extra foreground time. There is NO
+ * profile-RAM poke and NO decoder-address sync any more (the old code watched a
+ * per-firmware rx_pending RAM offset, which was not agnostic). */
 static void rx_service_pending(AppCtx* a) {
-    uint32_t off = a->emu && a->emu->prof ? a->emu->prof->rx_pending : 0;
-    if(!off || off < PA_RAM_BASE || off >= PA_RAM_BASE + PA_RAM_SIZE) return;
-    uint8_t* pending = &a->emu->ram[off - PA_RAM_BASE];
-    if(*pending != 0xFFu) return;
-    for(uint32_t i = 0; i < 40u && *pending == 0xFFu; i++)
-        emu_run_burst(a->emu, 30000u);
-    if(*pending == 0xFFu)
-        ESP_LOGW(TAG, "RX decoder frame pending after 1.2M foreground instructions");
-    else
-        ESP_LOGI(TAG, "RX decoder frame consumed by firmware foreground loop");
+    if(!a->emu) return;
+    for(uint32_t i = 0; i < 8u; i++) emu_run_burst(a->emu, 30000u);
 }
 
 /* ------------------------------------------------------- inbound dispatch ---- */
@@ -401,7 +461,11 @@ static void on_frame(uint8_t type, const uint8_t* payload, uint16_t len, void* c
         uart_proto_send(a->up, PROTO_MSG_FB, fb, (uint16_t)sizeof(fb));
         break;
     }
+    case PROTO_MSG_UNLOCK:
+        fw_unlock(a, payload, len);
+        break;
     case PROTO_MSG_RESET:
+        /* Re-run the last installed knock (same as the previous UNLOCK). */
         emu_reset_and_unlock(a->emu);
         break;
     default:
@@ -441,9 +505,13 @@ void app_main(void) {
         ESP_LOGI(TAG, "embedded firmware: %u bytes", (unsigned)fw_len);
         const ArmProfile* prof = PANDORA_PROFILE;
         if(emu_init(&emu, prof, fw_start, fw_len) == 0) {
+            /* Embedded default knock (firmware config). Override via the wire
+             * with PROTO_MSG_UNLOCK (the user's knock sequence). */
+            emu_set_knock(&emu, EMBED_KNOCK_SEQ, (uint8_t)sizeof(EMBED_KNOCK_SEQ),
+                          EMBED_KNOCK_GATE);
             emu_reset_and_unlock(&emu);
             app.emu_ready = true;
-            ESP_LOGI(TAG, "embedded boot: profile=%s unlocked=%d free heap=%u",
+            ESP_LOGI(TAG, "embedded boot: hw=%s unlocked=%d free heap=%u",
                      prof->name, emu.unlocked, (unsigned)esp_get_free_heap_size());
 #ifdef PANDORA_DEBUG_ASCII
             for(int i = 0; i < 40; i++) emu_run_burst(&emu, 50000);

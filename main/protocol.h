@@ -6,6 +6,11 @@
  * Flipper companion app). It only declares constants and the frame layout; no
  * platform-specific types are used (only <stdint.h>).
  *
+ * KEEP THIS FILE BYTE-FOR-BYTE IDENTICAL to the Flipper copy at
+ *   Flipper-ARF/applications/system/Pandora-esp32/pandora_esp32_protocol.h
+ * (only the leading comment's file name differs between the two copies; the
+ * declarations below MUST match exactly).
+ *
  * WIRE FORMAT (every frame, both directions):
  *
  *     +------+------+------+-----------------+------+
@@ -19,6 +24,13 @@
  *   - CRC8  : CRC-8 (poly 0x07, init 0x00) over TYPE + LEN(2) + PAYLOAD.
  *
  * The CRC does NOT cover the SYNC byte (the SYNC is only a resync aid).
+ *
+ * AGNOSTIC NOTE (protocol v2): the emulator is now AGNOSTIC of the firmware. The
+ * HARDWARE is identical for every firmware of this keyfob, so there is NO profile
+ * selection any more. The uploaded .hex can be ANY firmware for this MCU. The
+ * unlock KNOCK-CODE (which IS firmware config, not hardware) is sent explicitly by
+ * the Flipper via PROTO_MSG_UNLOCK as a button SEQUENCE, instead of being derived
+ * from a per-firmware profile id. FW_BEGIN no longer carries a profile field.
  */
 #ifndef PANDORA_PROTOCOL_H
 #define PANDORA_PROTOCOL_H
@@ -47,6 +59,12 @@
 #define PROTO_MSG_LOG 0x04u
 /* Handshake / keepalive reply. payload: ASCII banner. */
 #define PROTO_MSG_PONG 0x05u
+/* Result after FW_END. payload: proto_fw_ack_t {ok, flat_size}. ok=1 if the HEX
+ * parsed and the emulator initialized successfully. */
+#define PROTO_MSG_FW_ACK 0x06u
+/* Optional progress during upload. payload: proto_fw_progress_t. */
+#define PROTO_MSG_FW_PROGRESS 0x07u
+#define PROTO_MSG_BEEP 0x08u /* firmware-driven buzzer activity */
 
 /* -------------------------------------------------------- Flipper -> ESP32 -- */
 /* Button state. payload: 1 byte bitmask (PROTO_BTN_*). */
@@ -57,7 +75,7 @@
 #define PROTO_MSG_PING 0x83u
 /* Request a full framebuffer resend (e.g. on Flipper (re)connect). */
 #define PROTO_MSG_REQ_FB 0x84u
-/* Reset + re-unlock the emulator. payload: none. */
+/* Reset + re-run the last unlock knock on the emulator. payload: none. */
 #define PROTO_MSG_RESET 0x85u
 
 /* ------------------------------------------- firmware upload (Flipper -> ESP32)
@@ -67,13 +85,14 @@
  * ESP32 over this same UART link. The ESP32 parses the Intel HEX INCREMENTALLY
  * (line by line, as chunks arrive) straight into a flat flash image, so the raw
  * .hex text (~193 KB) is NEVER buffered whole. On FW_END the ESP32 (re)inits the
- * emulator with the flat image + the requested profile and auto-unlocks.
+ * emulator with the flat image. The firmware is AGNOSTIC: any .hex for this MCU.
  *
  * Sequence:
- *   Flipper: FW_BEGIN {total_hex_bytes, profile}   -> resets the HEX parser
+ *   Flipper: FW_BEGIN {total_hex_bytes}             -> resets the HEX parser
  *   Flipper: FW_CHUNK <raw .hex ASCII bytes> ...    -> parsed incrementally
- *   Flipper: FW_END   {crc32? (optional)}           -> finalize + emu_init + unlock
+ *   Flipper: FW_END   {crc32? (optional)}           -> finalize + emu_init
  *   ESP32  : FW_ACK   {ok, flat_size}               -> result of the whole load
+ *   Flipper: UNLOCK   {knock sequence}              -> emu_set_knock + unlock
  *
  * FW_PROGRESS (ESP32 -> Flipper) is optional and only informational.
  */
@@ -86,34 +105,45 @@
  * the next chunk. */
 #define PROTO_MSG_FW_CHUNK 0x87u
 /* End of firmware upload. payload: none, OR proto_fw_end_t (optional CRC32 of
- * the full .hex text for integrity). Triggers HEX finalize + emu_init +
- * emu_reset_and_unlock. */
+ * the full .hex text for integrity). Triggers HEX finalize + emu_init. */
 #define PROTO_MSG_FW_END 0x88u
+/* Batched CC1101 RX edges: uint16 count (LE) followed by count proto_rf_edge_t.
+ * Preferred over PROTO_MSG_RX_EDGE for throughput; the ESP32 injects each edge
+ * into the firmware demodulator (PB0 + TIMER1 capture) in order. */
 #define PROTO_MSG_RX_EDGES 0x89u
-#define PROTO_MSG_STOP 0x8Au /* stop emulation when the Flipper frontend exits */
-
-/* ---------------------------------------- firmware upload (ESP32 -> Flipper) -- */
-/* Result after FW_END. payload: proto_fw_ack_t {ok, flat_size}. ok=1 if the HEX
- * parsed and the emulator initialized + unlocked successfully. */
-#define PROTO_MSG_FW_ACK 0x06u
-/* Optional progress during upload. payload: proto_fw_progress_t. */
-#define PROTO_MSG_FW_PROGRESS 0x07u
-#define PROTO_MSG_BEEP 0x08u /* firmware-driven buzzer activity */
-
-/* ------------------------------------------------------- firmware profiles -- */
-/* Selects which keyfob HW profile the ESP32 uses for the uploaded image. Must
- * match the emulator's extern profiles (see emulator.h). */
-#define PROTO_FW_PROFILE_PANDORAMAX 0u
-#define PROTO_FW_PROFILE_PANDORA 1u
+/* Stop/reset the remote emulator when the Flipper frontend exits. payload: none. */
+#define PROTO_MSG_STOP 0x8Au
+/* AUTO-UNLOCK by knock-code (Flipper -> ESP32). payload: proto_unlock_t header
+ * followed by `count` proto_knock_step_t. The ESP32 installs the sequence with
+ * emu_set_knock() and then runs emu_reset_and_unlock() (presses it over GPIO).
+ * Send this AFTER FW_ACK. A count of 0 disables auto-unlock (manual nav only). */
+#define PROTO_MSG_UNLOCK 0x8Bu
 
 /* ------------------------------------------------------------ button bits --- */
-/* One bit per keyfob logical button. Matches the emulator's B_* enum order. */
+/* One bit per keyfob logical button. Matches the emulator's B_* enum order
+ * (B_UP=0, B_DOWN=1, B_OK=2, B_BACK=3, B5=4, B6=5). These bit positions are also
+ * reused as the knock-step button ids in proto_knock_step_t.button below. */
 #define PROTO_BTN_UP (1u << 0)
 #define PROTO_BTN_DOWN (1u << 1)
 #define PROTO_BTN_OK (1u << 2)
 #define PROTO_BTN_BACK (1u << 3)
 #define PROTO_BTN_B5 (1u << 4)
 #define PROTO_BTN_B6 (1u << 5)
+
+/* Logical keyfob button INDICES (NOT bitmasks). Used by the knock-code steps and
+ * the unlock gate; identical to the emulator's B_* enum so the ESP32 can pass
+ * them straight to emu_set_knock() / emu_press_button(). */
+#define PROTO_BTN_ID_UP 0u
+#define PROTO_BTN_ID_DOWN 1u
+#define PROTO_BTN_ID_OK 2u
+#define PROTO_BTN_ID_BACK 3u
+#define PROTO_BTN_ID_B5 4u
+#define PROTO_BTN_ID_B6 5u
+#define PROTO_BTN_ID_NONE 0xFFu /* "no gate" sentinel for proto_unlock_t.gate */
+
+/* Maximum number of knock steps carried in one PROTO_MSG_UNLOCK. Matches the
+ * emulator's knock_seq[16] capacity. */
+#define PROTO_KNOCK_MAX_STEPS 16u
 
 /* ------------------------------------------------------------ RF state ------ */
 /* Mirrors the Si4432 operating mode derived in the emulator. */
@@ -147,10 +177,10 @@ typedef struct PROTO_PACKED {
 } proto_rf_edge_t;
 
 /* ----------------------------------------------------- firmware upload ------- */
-/* FW_BEGIN payload. */
+/* FW_BEGIN payload. AGNOSTIC: no profile field -- any .hex for this MCU loads
+ * onto the single hardware model. */
 typedef struct PROTO_PACKED {
     uint32_t total_hex_bytes; /* size of the .hex text to be streamed (hint) */
-    uint8_t profile; /* PROTO_FW_PROFILE_* */
 } proto_fw_begin_t;
 
 /* FW_END payload (optional; LEN may be 0 to skip the CRC check). */
@@ -160,7 +190,7 @@ typedef struct PROTO_PACKED {
 
 /* FW_ACK payload (ESP32 -> Flipper, sent after FW_END). */
 typedef struct PROTO_PACKED {
-    uint8_t ok; /* 1 = parse + emu_init + unlock OK, 0 = failure */
+    uint8_t ok; /* 1 = parse + emu_init OK, 0 = failure */
     uint32_t flat_size; /* size of the parsed flat flash image in bytes */
 } proto_fw_ack_t;
 
@@ -169,6 +199,31 @@ typedef struct PROTO_PACKED {
     uint32_t hex_bytes_seen; /* raw .hex bytes consumed so far */
     uint32_t flat_bytes; /* highest flat address written so far + 1 */
 } proto_fw_progress_t;
+
+/* ----------------------------------------------------- auto-unlock knock ----
+ *
+ * The knock-code is a SEQUENCE OF BUTTON PRESSES (the real Pandora keyfobs are
+ * unlocked with a button combo, e.g. UP,OK,OK,UP,UP,DOWN followed by holding a
+ * gate button). It is FIRMWARE CONFIG, so the Flipper owns it and sends it here;
+ * the agnostic emulator just presses it over GPIO at reset.
+ *
+ * PROTO_MSG_UNLOCK payload layout:
+ *     proto_unlock_t                       (header)
+ *     proto_knock_step_t  step[count]      (the sequence, count from the header)
+ *
+ * Each step is one button tap. `hold` marks a long-press tap. The final held
+ * GATE button (held down while the firmware validates the combo) is given once
+ * in the header `gate` field (a PROTO_BTN_ID_*, or PROTO_BTN_ID_NONE).
+ */
+typedef struct PROTO_PACKED {
+    uint8_t button; /* PROTO_BTN_ID_* (logical keyfob button index) */
+    uint8_t hold; /* 0 = short tap, 1 = long press */
+} proto_knock_step_t;
+
+typedef struct PROTO_PACKED {
+    uint8_t count; /* number of proto_knock_step_t that follow (0..16) */
+    uint8_t gate; /* PROTO_BTN_ID_* final held gate button, or PROTO_BTN_ID_NONE */
+} proto_unlock_t;
 
 /* ------------------------------------------------------------ CRC-8 --------- */
 /* CRC-8, polynomial 0x07, init 0x00 (a.k.a. CRC-8/SMBUS without final XOR).
