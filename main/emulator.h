@@ -141,6 +141,15 @@ typedef struct EmuState {
     /* minimal NVIC (agnostic: driven by the firmware's REAL ISER/ICER) */
     uint8_t in_irq;
     uint8_t irq_rr;
+    /* Pending UI tick request. The reference (Unicorn pandora_tui) raises a
+     * _pending_tick after EVERY run_burst from its button/boot drivers, which
+     * forces one IRQ (timer) tick at the start of the next burst IN ADDITION to
+     * the periodic one. That extra per-burst tick is what gives the firmware's UI
+     * TIMER IRQ (IRQ13) its correct cadence; without it the C core fired IRQ13
+     * ~30% less often than Unicorn, so post-unlock the firmware's screen state
+     * machine stayed in the 3-scanner UI loop (never reading the OK/UP/DOWN
+     * button ports) and navigation did nothing. Mirror the oracle exactly. */
+    uint8_t pending_tick;
     uint32_t tick_count;
     uint64_t last_tick_insn;
     /* Mask of IRQs the firmware has ENABLED right now (NVIC ISER set / ICER
@@ -201,6 +210,19 @@ typedef struct EmuState {
     uint8_t knock_seq[16];
     uint8_t knock_len;
     int knock_gate; /* B_* index of the final held gate, or -1 for none */
+
+    /* --- GPIO EXTI (external interrupt) delivery ---------------------------
+     * Both firmwares read the nav buttons via the EFM32 GPIO external interrupt
+     * (GPIO_EVEN=IRQ1 even pins, GPIO_ODD=IRQ11 odd pins), NOT by polling ports
+     * 2/5. The post-unlock UI loop only polls port 0 directly; the OK/UP/DOWN
+     * edges reach the firmware through its GPIO ISR. The core must raise the
+     * GPIO IRQ on a real button pin edge, or those presses are lost (erratic
+     * navigation). gpio_if is the latched EXTI IF register (read at 0x40006114);
+     * pending_gpio_* ask the scheduler to enter the GPIO ISR. Agnostic: driven
+     * by the observed button pin edge + the firmware's own IEN/ISER. */
+    uint16_t gpio_if;
+    uint8_t pending_gpio_even;
+    uint8_t pending_gpio_odd;
 } EmuState;
 
 /* ------------------------------------------------------------ API ----------- */

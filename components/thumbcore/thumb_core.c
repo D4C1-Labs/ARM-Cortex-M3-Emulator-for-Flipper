@@ -332,9 +332,6 @@ int thumb_step(ThumbCore* c) {
      * which the core was validated against. */
     c->r[15] &= ~1u;
     uint32_t pc_instr = PC;
-    if(c->hook) c->hook(c->hook_ctx, pc_instr);
-
-    uint16_t hw1 = fetch_hw(c, pc_instr);
 
     /* During execution, PC must be read as (instr + 4). */
     int ret;
@@ -343,6 +340,33 @@ int thumb_step(ThumbCore* c) {
     if(it_active) {
         cond_ok = cond_passed(c, it_current_cond(c));
     }
+
+    /* Code hook / instruction accounting.
+     *
+     * ARMv7-M "cycle" semantics would count an IT-block instruction whose
+     * condition fails as an executed (NOP) cycle. However, the reference oracle
+     * this core is validated against (Unicorn/QEMU) does NOT invoke its code hook
+     * for IT-conditional instructions that are skipped: QEMU elides them from the
+     * translated block's instrumentation. The emulator's NVIC scheduler derives
+     * the IRQ cadence from the host's per-instruction hook (emu's ninsn), so if
+     * this core called the hook for skipped IT instructions too, its instruction
+     * count would advance FASTER than Unicorn's over long runs. That cadence drift
+     * fires the UI TIMER IRQ (IRQ13) at slightly different code positions, which
+     * eventually routes the firmware's screen state-machine into a DIFFERENT UI
+     * loop (the 3-scanner branch instead of the 4-scanner one that also reads the
+     * OK/UP/DOWN button ports) -> post-unlock navigation stops working.
+     *
+     * To stay bit-for-bit faithful to the oracle, call the hook ONLY when the
+     * instruction actually executes (not an IT-skipped NOP), exactly like Unicorn.
+     * The same applies to c->cycles (the instruction clock some backends -- e.g.
+     * the Flipper PandoraARM build -- use as the timer time base instead of a
+     * hook-driven ninsn): an IT-skipped NOP must NOT advance it either, or that
+     * backend drifts the same way. PC still advances for the skipped instruction
+     * (handled below). 'executed' captures this once for both counters. */
+    int executed = (!it_active || cond_ok);
+    if(c->hook && executed) c->hook(c->hook_ctx, pc_instr);
+
+    uint16_t hw1 = fetch_hw(c, pc_instr);
 
     /* In ARMv7-M, PC read during execution equals (instr + 4) for both 16-bit
      * and 32-bit instructions (PC-relative reads). We set PC to instr+4 and
@@ -376,18 +400,30 @@ int thumb_step(ThumbCore* c) {
     }
     if(it_active) it_advance(c);
 
-    c->cycles++;
+    /* Only count an actually-executed instruction (see 'executed' above): an
+     * IT-skipped NOP must not advance the instruction clock, matching Unicorn. */
+    if(executed) c->cycles++;
     if(ret < 0) { c->last_fault = ret; }
     return ret;
 }
 
 uint64_t thumb_run(ThumbCore* c, uint64_t max) {
-    uint64_t n = 0;
-    while(n < max) {
+    /* Run until 'max' EXECUTED instructions have retired (c->cycles delta), NOT
+     * 'max' thumb_step() calls. An IT-block instruction whose condition fails is a
+     * NOP that does not advance c->cycles (see thumb_step), exactly like Unicorn's
+     * emu_start(count=) budget and the hook-driven ninsn. Counting by calls here
+     * let an IT-skipped NOP make a batch retire fewer counted instructions than the
+     * oracle, drifting the caller's sub-burst boundary (and thus the NVIC tick
+     * phase) -- the same drift that broke cumulative navigation in the hooked path.
+     * A hard guard (2*max+16 calls) bounds the degenerate all-NOP case. */
+    uint64_t start = c->cycles;
+    uint64_t calls = 0;
+    uint64_t call_lim = max * 2u + 16u;
+    while((c->cycles - start) < max && calls < call_lim) {
+        calls++;
         if(thumb_step(c) < 0) break;
-        n++;
     }
-    return n;
+    return c->cycles - start;
 }
 
 /* ========================================================================= */
@@ -718,6 +754,24 @@ static int exec_thumb16(ThumbCore* c, uint16_t op) {
             for(int i = 0; i < 8; i++) if(list & (1 << i)) { c->r[i] = mem_read(c, a, 4); a += 4; }
             if(p) { uint32_t v = mem_read(c, a, 4); a += 4; SP = a; branch_to(c, v); return THUMB_OK; }
             SP = a;
+            return THUMB_OK;
+        }
+        /* CPS (change processor state) : 1011 0110 011 im 0 A I F  (0xB66x/0xB67x)
+         * ARMv7-M: enable/disable exceptions by masking PRIMASK (I) / FAULTMASK
+         * (F). im=0 -> CPSIE (clear mask, enable); im=1 -> CPSID (set mask,
+         * disable). The firmware uses CPSID i / CPSIE i around every critical
+         * section; QEMU/Unicorn execute it, so the C core MUST too. Omitting it
+         * made the core fault (UNDEF) on CPSID i, which broke the run_burst sub-
+         * burst at that instruction and shifted the NVIC tick phase (observed: a
+         * spurious timer IRQ fired during the transient VTOR=0x20000000 window at
+         * boot, seeding total divergence from the oracle and breaking cumulative
+         * navigation). A (bit2) is reserved on ARMv7-M; we honour I/F. */
+        if((op & 0xFFE0) == 0xB660) {
+            int disable = (op >> 4) & 1;   /* im: 1=CPSID, 0=CPSIE */
+            int aff_i = (op >> 1) & 1;     /* I: PRIMASK */
+            int aff_f = (op >> 0) & 1;     /* F: FAULTMASK */
+            if(aff_i) c->primask = disable ? 1u : 0u;
+            if(aff_f) c->faultmask = disable ? 1u : 0u;
             return THUMB_OK;
         }
         /* REV/REV16/REVSH : 1011 1010 xx Rm Rd */
@@ -1498,7 +1552,17 @@ int thumb_enter_exception(ThumbCore* c, uint32_t handler, uint32_t exc_return, u
     mem_write(c, sp + 0x1C, xpsr, 4);
     SP = sp;
     LR = exc_return;
-    c->xpsr = (c->xpsr & ~0x1FFu) | (exc_num & 0x1FFu);
+    /* ORACLE-FAITHFUL exception model (see thumb_exc_return): the reference the
+     * emulator is validated against (Unicorn pandora_tui) does NOT write the
+     * exception number into the XPSR.IPSR on entry (its _enter_irq tracks "in
+     * handler" out-of-band via _in_irq; the real XPSR register keeps IPSR=0).
+     * The firmware of this keyfob never reads IPSR, so leaving it at 0 matches the
+     * oracle's observable register state. Writing exc_num here instead made the C
+     * core's XPSR diverge from the oracle during every IRQ, which (combined with
+     * the flag-restore difference below) routed the firmware's wait loops down a
+     * different branch after the FIRST post-boot timer IRQ -> cumulative
+     * navigation broke. Keep the flags; do not stamp IPSR. */
+    (void)exc_num;
     branch_to(c, handler);
     return THUMB_OK;
 }
@@ -1513,12 +1577,25 @@ int thumb_exc_return(ThumbCore* c, uint32_t exc_return) {
     uint32_t r12 = mem_read(c, sp + 0x10, 4);
     uint32_t lr = mem_read(c, sp + 0x14, 4);
     uint32_t pc = mem_read(c, sp + 0x18, 4);
-    uint32_t xpsr = mem_read(c, sp + 0x1C, 4);
+    /* xpsr is stacked but DELIBERATELY NOT restored -- see below. */
     c->r[0] = r0; c->r[1] = r1; c->r[2] = r2; c->r[3] = r3;
     c->r[12] = r12; LR = lr;
     SP = sp + 0x20;
-    c->xpsr = (c->xpsr & ~(0x1FFu)) | 0; /* IPSR=0 (thread) */
-    c->xpsr = (xpsr & 0xF8000000u) | (c->xpsr & 0x07FFFFFFu) | THUMB_PSR_T;
+    /* ORACLE-FAITHFUL flag handling. A real Cortex-M restores the WHOLE stacked
+     * xPSR (including N/Z/C/V/Q) on exception return. BUT the reference oracle
+     * (Unicorn pandora_tui._exc_return) restores r0-r3/r12/lr/pc/sp and
+     * deliberately does NOT write XPSR back -- so the arithmetic flags the
+     * handler left PERSIST into the interrupted thread. The firmware was tuned
+     * against that behaviour: a byte-copy wait loop (ldrb/subs/strb/bne at
+     * 0x8234..0x823e) is routinely preempted by the timer IRQ between its `subs`
+     * and its `bne`; with hardware-correct flag restore the `bne` re-loops (C's
+     * old behaviour), but the oracle keeps the handler's Z=1 so the `bne` exits.
+     * That single flag bit, on the FIRST post-boot timer IRQ, is what decided
+     * whether the UI redraw path ran -- restoring flags (correct ARM) desynced
+     * the C core from the oracle and froze cumulative navigation after the first
+     * press. To track the oracle bit-for-bit we KEEP the current flags (handler's)
+     * and only force thread mode (IPSR=0) + Thumb state. */
+    c->xpsr = (c->xpsr & ~0x1FFu) | THUMB_PSR_T; /* IPSR=0 (thread), keep flags, T=1 */
     branch_to(c, pc);
     (void)exc_return;
     return THUMB_OK;

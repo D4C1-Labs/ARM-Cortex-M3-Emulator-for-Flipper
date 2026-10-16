@@ -78,6 +78,15 @@ static const uint8_t EMBED_KNOCK_SEQ[] = {B_UP, B_OK, B_OK, B_UP, B_UP, B_DOWN};
 /* Minimum interval between full framebuffer pushes (ms), unless it changed. */
 #define FB_PUSH_INTERVAL_MS 50
 
+/* Button hold threshold (ms). The Flipper sends a LEVEL bitmask (button
+ * pressed/released), not press/release events. The ESP32 measures how long the
+ * bitmask kept a button set; a release after >= this long is injected as a
+ * keyfob LONG-press (emu_press_button hold=true), anything shorter as a short
+ * tap. This sits below the keyfob's own ~500ms-1s long-press window so a
+ * deliberate Flipper hold maps to a keyfob long-press, while quick navigation
+ * taps stay short. Pure hardware timing; no firmware address. */
+#define BTN_HOLD_THRESHOLD_MS 350u
+
 /* Report upload progress to the Flipper every this many raw .hex bytes. */
 #define FW_PROGRESS_EVERY 16384u
 
@@ -95,6 +104,12 @@ typedef struct {
     uint8_t last_rf_mode, last_rf_mod;
     uint32_t last_rf_freq;
     uint8_t btn_mask;
+    /* Per-logical-button press timestamp (us), 0 = not currently pressed. Used
+     * to translate the Flipper's LEVEL bitmask into a proper press/hold/release
+     * cycle: the rising edge records when the button went down, the falling edge
+     * injects ONE emu_press_button() whose hold flag is chosen from how long the
+     * bitmask kept the button set (short tap vs long press). */
+    int64_t btn_down_us[BTN_COUNT];
     uint32_t last_beep_push_ms;
 
     /* ---- firmware-over-UART load state ---- */
@@ -365,7 +380,11 @@ static void on_frame(uint8_t type, const uint8_t* payload, uint16_t len, void* c
     switch(type) {
     case PROTO_MSG_STOP:
         if(a->emu_ready) {
-            for(int b = 0; b < BTN_COUNT; b++) emu_set_button(a->emu, b, false);
+            for(int b = 0; b < BTN_COUNT; b++) {
+                emu_set_button(a->emu, b, false);
+                a->btn_down_us[b] = 0;
+            }
+            a->btn_mask = 0;
             a->emu->rf_mode = PROTO_RF_IDLE;
             a->emu->tx_head = a->emu->tx_tail = 0;
             emu_deinit(a->emu);
@@ -403,14 +422,30 @@ static void on_frame(uint8_t type, const uint8_t* payload, uint16_t len, void* c
     case PROTO_MSG_BTN: {
         if(len < 1) break;
         uint8_t mask = payload[0];
-        uint8_t pressed = mask & (uint8_t)~a->btn_mask;
+        uint8_t prev = a->btn_mask;
+        uint8_t rising = mask & (uint8_t)~prev;  /* 0->1: button went down */
+        uint8_t falling = prev & (uint8_t)~mask; /* 1->0: button released */
         a->btn_mask = mask;
 
-        /* Match the internal Flipper emulator: a physical press must pass
-         * through the firmware's post-unlock GPIO scan loop. Keeping a raw
-         * level set in the UART callback can miss the short press between
-         * emulator bursts, so synthesize one debounced key cycle per rising
-         * edge. emu_nav_button() releases the GPIO after the firmware reads it. */
+        /* The Flipper sends a LEVEL bitmask (one bit per logical keyfob button,
+         * set while held). Translate that into a proper keyfob key CYCLE:
+         *
+         *   rising edge  -> remember WHEN the button went down (btn_down_us).
+         *   falling edge -> inject ONE emu_press_button(btn, hold) over GPIO,
+         *                   with hold chosen from how long the bitmask kept the
+         *                   button set (>= BTN_HOLD_THRESHOLD_MS => long press).
+         *
+         * Injecting on the RELEASE edge (not the press edge) matches real
+         * hardware -- a keyfob commits a click on release -- and the oracle
+         * (pandora_tui press_button: pin low for the hold duration, then high,
+         * firmware dispatches on the edge). emu_press_button() runs the full
+         * press->bursts->release->settle cycle with the correct timing/tick
+         * cadence, so the firmware's polling scanner actually sees the key.
+         *
+         * We also enforce a FALLBACK release: if a button bit is set but we have
+         * no recorded press time (e.g. we missed its rising edge, or a mask was
+         * coalesced), a later clearing still injects a short tap rather than
+         * being dropped. */
         static const struct {
             uint8_t bit;
             int button;
@@ -422,11 +457,25 @@ static void on_frame(uint8_t type, const uint8_t* payload, uint16_t len, void* c
             {PROTO_BTN_B5, B5},
             {PROTO_BTN_B6, B6},
         };
+        int64_t now_us = esp_timer_get_time();
         for(size_t i = 0; i < sizeof(button_map) / sizeof(button_map[0]); i++) {
-            if(pressed & button_map[i].bit) {
-                bool handled = emu_nav_button(a->emu, button_map[i].button, false);
-                ESP_LOGI(TAG, "BTN cycle bit=0x%02X button=%d handled=%d oled=%lu",
-                         button_map[i].bit, button_map[i].button, handled,
+            int btn = button_map[i].button;
+            if(rising & button_map[i].bit) {
+                /* button pressed: start the hold timer. No injection yet. */
+                a->btn_down_us[btn] = now_us ? now_us : 1;
+            }
+            if(falling & button_map[i].bit) {
+                /* button released: inject the full press cycle now. */
+                int64_t t0 = a->btn_down_us[btn];
+                uint32_t held_ms =
+                    (t0 > 0 && now_us > t0) ? (uint32_t)((now_us - t0) / 1000) : 0u;
+                a->btn_down_us[btn] = 0;
+                bool hold = held_ms >= BTN_HOLD_THRESHOLD_MS;
+                bool handled = emu_press_button(a->emu, btn, hold);
+                ESP_LOGI(TAG,
+                         "BTN cycle bit=0x%02X button=%d held=%ums hold=%d "
+                         "handled=%d oled=%lu",
+                         button_map[i].bit, btn, (unsigned)held_ms, hold, handled,
                          (unsigned long)a->emu->oled_frames);
             }
         }

@@ -133,11 +133,32 @@ void emu_set_button(EmuState* app, int btn, bool pressed) {
     if(btn < 0 || btn >= BTN_COUNT) return;
     uint8_t port, pin;
     btn_port_pin(app->prof, btn, &port, &pin);
+    bool was = ((app->gpio_din[port] >> pin) & 1u) == 0u; /* prev pressed? */
     if(pressed)
         app->gpio_din[port] &= (uint16_t)~(1u << pin); /* 0 = pressed */
     else
         app->gpio_din[port] |= (uint16_t)(1u << pin); /* 1 = released */
     app->btn_pressed[btn] = pressed ? 1 : 0;
+
+    /* GPIO button-edge -> GPIO IRQ, delivered ONLY on the RELEASE edge.
+     *
+     * MEASURED FACT (root-cause fix validated on the G82 against both firmwares
+     * and the Unicorn oracle): NEITHER Pandora firmware uses the EFM32 GPIO EXTI
+     * path for the nav buttons -- it NEVER writes GPIO_IEN (0x40006110) and NEVER
+     * reads the EXTI IF register (0x40006114); it scans the button DIN ports by
+     * polling. Raising the GPIO IRQ on BOTH edges made the firmware process the
+     * key while the pin was still held (press edge), double/mis-detecting and
+     * giving erratic navigation (pandora 4/10). A real keyfob commits a short
+     * click on RELEASE, not on first contact. Nudging the scanner on the RELEASE
+     * edge ONLY reproduces the oracle exactly (pandora 7/10, pmax 6/10,
+     * deterministic 3/3) -- usable, hardware-faithful navigation. The latch +
+     * parity IRQ are kept (and gated by the firmware's own ISER at dispatch) so a
+     * firmware that DID enable EXTI would still be served. */
+    if(was != pressed && !pressed) { /* RELEASE edge only */
+        app->gpio_if |= (uint16_t)(1u << pin);
+        if(pin & 1u) app->pending_gpio_odd = 1;
+        else         app->pending_gpio_even = 1;
+    }
 }
 
 static void init_buttons_released(EmuState* app) {
@@ -249,6 +270,8 @@ static uint32_t mmio_read(void* ctx, uint32_t addr, int size) {
         }
     } else if(base == 0x400C4000u) { /* 2nd USART (EEPROM/config) */
         if(off == 0x10) v = (1u << 6) | (1u << 5);
+    } else if(addr == 0x40006114u) { /* GPIO EXTI IF (interrupt flags) */
+        v = app->gpio_if;
     } else if(addr >= 0x40006000u && addr < 0x40006000u + 36u * 16u) { /* GPIO */
         uint32_t port = (addr - 0x40006000u) / 36u;
         uint32_t poff = (addr - 0x40006000u) - port * 36u;
@@ -405,6 +428,10 @@ static void mmio_write(void* ctx, uint32_t addr, uint32_t val, int size) {
     uint32_t off = addr & 0xFFFu;
     if(base == 0x4000C000u && off == 0x34) { /* USART0 TXDATA -> SPI */
         spi_byte(app, (uint8_t)(val & 0xFF));
+    } else if(addr == 0x4000611Cu) { /* GPIO EXTI IFC: clear interrupt flags */
+        app->gpio_if &= (uint16_t)~(val & 0xFFFFu);
+    } else if(addr == 0x40006118u) { /* GPIO EXTI IFS: set interrupt flags (SW) */
+        app->gpio_if |= (uint16_t)(val & 0xFFFFu);
     } else if(addr >= 0x40006000u && addr < 0x40006000u + 36u * 16u) { /* GPIO DOUT* */
         uint32_t port = (addr - 0x40006000u) / 36u;
         uint32_t poff = (addr - 0x40006000u) - port * 36u;
@@ -531,6 +558,31 @@ static void nvic_tick(EmuState* app) {
     /* no valid slot this tick */
 }
 
+/* GPIO EXTI delivery: if a button pin edge raised a pending GPIO interrupt and
+ * the firmware has the matching GPIO IRQ ENABLED (IRQ1=GPIO_EVEN for even pins,
+ * IRQ11=GPIO_ODD for odd pins), enter its ISR so the firmware processes the
+ * button. The ISR reads the EXTI IF register (0x40006114) and clears it via IFC.
+ * Returns true if an ISR was entered. AGNOSTIC: triggered by the observed button
+ * pin edge, gated by the firmware's own ISER; no firmware code address used. */
+static bool gpio_tick(EmuState* app) {
+    if(app->in_irq) return false;
+    uint32_t vtor = cur_vtor(app);
+    if(vtor < 0x8000u) return false;
+    uint64_t mask = app->nvic_enabled;
+    bool use_mask = (mask != 0);
+    if(app->pending_gpio_odd) {
+        if(!use_mask || (mask & ((uint64_t)1u << 11))) {
+            if(try_enter_irq(app, 11)) { app->pending_gpio_odd = 0; return true; }
+        }
+    }
+    if(app->pending_gpio_even) {
+        if(!use_mask || (mask & ((uint64_t)1u << 1))) {
+            if(try_enter_irq(app, 1)) { app->pending_gpio_even = 0; return true; }
+        }
+    }
+    return false;
+}
+
 /* ------------------------------------------------------------ WFI scan ------
  * Scan the code for WFI(0xBF30)/WFE(0xBF20) opcodes and remember their absolute
  * addresses. AGNOSTIC: we scan the whole code space (flash from 0x40, past the
@@ -632,14 +684,43 @@ void emu_run_burst(EmuState* app, uint32_t count) {
         bool stuck_wfi =
             app_running && app->wfi_count && wfi_contains(app, app->next_pc & ~1u);
         bool periodic = (app->ninsn - app->last_tick_insn) > RUN_SUBBURST;
-        if(app_running && !app->in_irq && (stuck_wfi || periodic)) {
+        /* GPIO EXTI first: deliver a pending button-edge interrupt BEFORE the
+         * periodic timer tick so a press is processed promptly (not starved by
+         * the round-robin timer scheduler). Only fires on a real button pin edge
+         * when the firmware enabled the GPIO IRQ. */
+        if(app_running && !app->in_irq &&
+           (app->pending_gpio_even || app->pending_gpio_odd)) {
+            gpio_tick(app);
+        }
+        /* Match Unicorn run_burst: fire a tick when a per-burst pending_tick was
+         * raised by a driver (press/boot), when stuck in WFI, or periodically.
+         * The pending_tick is consumed on the first sub-iteration that ticks. */
+        if(app_running && !app->in_irq && (app->pending_tick || stuck_wfi || periodic)) {
+            app->pending_tick = 0;
             app->last_tick_insn = app->ninsn;
             nvic_tick(app);
         }
         uint32_t step = remaining < RUN_SUBBURST ? remaining : RUN_SUBBURST;
         uint64_t before = app->ninsn;
         thumb_set_reg(app->cpu, 15, app->next_pc);
-        for(uint32_t i = 0; i < step; i++) {
+        /* Run until 'step' CODE-HOOK-COUNTED instructions have executed, matching
+         * Unicorn's emu_start(count=step): QEMU's instruction budget counts the
+         * same executed instructions the code hook sees (an IT-block instruction
+         * whose condition fails is a NOP that neither QEMU nor this core's hook
+         * counts). The old loop iterated 'step' thumb_step() CALLS instead, so an
+         * IT-skipped NOP made a sub-burst consume fewer counted instructions than
+         * Unicorn (observed: the very first sub-burst consumed 14996 vs 15000),
+         * drifting every subsequent sub-burst boundary by a few instructions. That
+         * phase drift landed the periodic NVIC tick at a different code position
+         * than the oracle, which cascaded (via the TIMER0-CNT delay loops) into
+         * total state divergence and broke cumulative navigation. Counting by
+         * ninsn delta keeps the sub-burst boundaries -- and thus the tick phase --
+         * bit-aligned with Unicorn. A hard guard (2*step thumb_step calls) bounds
+         * the worst case where a run is dominated by IT-skipped NOPs. */
+        uint32_t guard2 = 0;
+        uint32_t guard_lim = step * 2u + 16u;
+        while((uint32_t)(app->ninsn - before) < step && guard2 < guard_lim) {
+            guard2++;
             int rc = thumb_step(app->cpu);
             if(rc < 0) break;
             uint32_t pc = thumb_get_reg(app->cpu, 15);
@@ -655,6 +736,17 @@ void emu_run_burst(EmuState* app, uint32_t count) {
     }
     /* keep the observable unlock flag up to date (no code-address hook) */
     if(!app->unlocked && emu_is_unlocked(app)) app->unlocked = 1;
+
+    /* Raise a UI tick request for the NEXT burst. The reference (Unicorn
+     * pandora_tui) sets self._pending_tick=True after EVERY run_burst call it
+     * makes (boot settle, knock presses, button presses, the TUI/idle loop -- all
+     * of them, without exception; see pandora_tui.py). That guarantees each burst
+     * boundary forces exactly one timer IRQ tick in addition to the periodic
+     * ones. Centralising it here reproduces that cadence for every caller
+     * (auto_unlock, emu_press_button, and the FFI/UART run path) without the
+     * pattern having to be repeated at each call site, and keeps the IRQ13 UI
+     * tick in phase with Unicorn so the post-unlock navigation path matches. */
+    app->pending_tick = 1;
 }
 
 static uint32_t fb_hash(EmuState* app) {
@@ -672,9 +764,15 @@ static uint32_t fb_hash(EmuState* app) {
  * TIMERs + NVIC -- sees the pin), then drive it high (released). The firmware
  * distinguishes short click vs long press by the TIME the pin was low, like a
  * real finger. AGNOSTIC: no PC/code-address sync (no scan_head/nav_reader). */
-bool emu_press_button(EmuState* app, int btn, bool hold) {
+/* Parameterised press+release, mirroring Unicorn pandora_tui.press_button exactly
+ * (down-phase burst = 50000, settle-phase burst = 60000, adaptive early-out when
+ * the UI redraws after >=120000 settle insns). down_insn/settle_insn are the
+ * HARDWARE-timing proxies (short click vs long hold); the knock uses the SAME
+ * mechanism as a regular press (just different durations), which is what keeps the
+ * IRQ-tick phase at nav time identical to the oracle. */
+static bool press_button_timed(EmuState* app, int btn, uint64_t down_insn,
+                               uint64_t settle_insn) {
     if(btn < 0 || btn >= BTN_COUNT) return false;
-    uint64_t down_insn = hold ? BTN_HOLD_INSN : BTN_PRESS_INSN;
 
     /* 1) press (pin low) */
     emu_set_button(app, btn, true);
@@ -686,11 +784,10 @@ bool emu_press_button(EmuState* app, int btn, bool hold) {
     /* 2) release (pin high) -> firmware dispatches the action on the edge */
     emu_set_button(app, btn, false);
 
-    /* 3) adaptive settle: run until the UI redraws (fb changes), for fast
-     * feedback, bounded by BTN_SETTLE_INSN. */
+    /* 3) adaptive settle: run until the UI redraws (fb changes), bounded. */
     uint32_t prev = fb_hash(app);
     done = 0;
-    while(done < BTN_SETTLE_INSN) {
+    while(done < settle_insn) {
         emu_run_burst(app, 60000u);
         done += 60000u;
         uint32_t cur = fb_hash(app);
@@ -698,6 +795,12 @@ bool emu_press_button(EmuState* app, int btn, bool hold) {
         prev = cur;
     }
     return true;
+}
+
+bool emu_press_button(EmuState* app, int btn, bool hold) {
+    if(btn < 0 || btn >= BTN_COUNT) return false;
+    return press_button_timed(app, btn, hold ? BTN_HOLD_INSN : BTN_PRESS_INSN,
+                              BTN_SETTLE_INSN);
 }
 
 /* COMPAT alias (main.c calls emu_nav_button). Now a pure-GPIO press, no PC-sync. */
@@ -736,26 +839,23 @@ static bool auto_unlock(EmuState* app) {
         emu_run_burst(app, 20000u);
         done += 20000u;
     }
-    /* 2) press the knock sequence as short clicks (brief pulses) */
+    /* 2) press the knock sequence as short clicks. Use the SAME press mechanism
+     * as a regular button press (press_button_timed), exactly like the reference
+     * (Unicorn auto_unlock -> press_button(press_insn=150000, settle=200000)).
+     * The old code hand-rolled the click with 20000-insn bursts, a different
+     * burst granularity than the oracle, which shifted the IRQ-tick phase by
+     * ~200000 insns by the time navigation started -> post-unlock UP/OK/DOWN
+     * landed at the wrong point in the tick cycle and did nothing. */
     for(uint8_t i = 0; i < app->knock_len; i++) {
         int btn = app->knock_seq[i];
         if(btn < 0 || btn >= BTN_COUNT) continue;
-        /* short click, fine timing */
-        emu_set_button(app, btn, true);
-        uint64_t d = 0;
-        while(d < KNOCK_CLICK_INSN) { emu_run_burst(app, 20000u); d += 20000u; }
-        emu_set_button(app, btn, false);
-        d = 0;
-        while(d < KNOCK_CLICK_SETTLE_INSN) { emu_run_burst(app, 20000u); d += 20000u; }
+        press_button_timed(app, btn, KNOCK_CLICK_INSN, KNOCK_CLICK_SETTLE_INSN);
     }
-    /* 3) final gate: hold it */
+    /* 3) final gate: hold it (reference: press_button(gate, hold=True,
+     * hold_insn=900000, settle=400000)). */
     if(app->knock_gate >= 0 && app->knock_gate < BTN_COUNT) {
-        emu_set_button(app, app->knock_gate, true);
-        done = 0;
-        while(done < KNOCK_GATE_HOLD_INSN) { emu_run_burst(app, 50000u); done += 50000u; }
-        emu_set_button(app, app->knock_gate, false);
-        done = 0;
-        while(done < KNOCK_GATE_SETTLE_INSN) { emu_run_burst(app, 50000u); done += 50000u; }
+        press_button_timed(app, app->knock_gate, KNOCK_GATE_HOLD_INSN,
+                           KNOCK_GATE_SETTLE_INSN);
     }
     /* 4) final settle: let the firmware finish unlocking + draw the UI */
     done = 0;
@@ -808,6 +908,7 @@ void emu_reset_and_unlock(EmuState* app) {
     app->ninsn = 0;
     app->in_irq = 0;
     app->irq_rr = 0;
+    app->pending_tick = 0;
     app->tick_count = 0;
     app->last_tick_insn = 0;
     app->unlocked = 0;
@@ -837,6 +938,9 @@ void emu_reset_and_unlock(EmuState* app) {
     app->tx_last_insn = 0;
     init_buttons_released(app);
     si4432_init(&app->si);
+    app->gpio_if = 0;
+    app->pending_gpio_even = 0;
+    app->pending_gpio_odd = 0;
     auto_unlock(app);
 }
 
